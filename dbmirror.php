@@ -19,8 +19,8 @@
     // Tamaño de los buferes de lectura.
     define('__max_buffer_size', 500);
 
-    // Numero de maximo de registros a cargar por consulta.
-    define('__max_records_by_query', 5000);
+    // Numero maximo de inserciones acumuladas.
+    define('__max_insert_size', 100);
 
     // Muestra la informacion de la aplicacion.
     showProgramInfo();
@@ -187,6 +187,7 @@
             $mySqlReader->Close();
             return 1;
         }
+        
         showMessage("Tabla de configuracion creada con exito...");
     } else {
         showMessage("Tabla de configuracion => ok...");
@@ -279,6 +280,8 @@
     $totalInserted = 0;
     $totalUpdated = 0;
     $totalDeleted = 0;
+    $insertListValues = '';
+    $insertListCount = 0;
     $totalRecords = 0;
 
     // Ciclo principal de replicacion.
@@ -298,7 +301,7 @@
 
         // Valida la tabla de destino.
         $n = $i + 1;
-        showMessage("\nValidando tabla $tableName... ($n de $totalSourceTables)");
+        showMessage("\nProcesando tabla $tableName... ($n de $totalSourceTables)");
 
         // Toma la estructura de la tabla origen.
         showMessage("   Cargando estructura de origen...");
@@ -424,8 +427,7 @@
 
         // Toma la lista de registros de la tabla de origen.
         showMessage("   Procesando registros de origen [$n Registro(s)]...");
-        $maxRecordsByQuery = __max_records_by_query;
-        $sqlCommand = "select top $maxRecordsByQuery __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > 0 order by __db_mirror_id__;";
+        $sqlCommand = "select __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > 0 order by __db_mirror_id__;";
         $sourceData = $sqlServer->Query($sqlCommand, true, __max_buffer_size);
 
         if ($sourceData === false) {
@@ -605,8 +607,7 @@
 
                             // Si no quedan registros en el buffer de la ultima consulta.
                             if ($totalSource == 0) {
-                                $maxRecordsByQuery = __max_records_by_query;
-                                $sqlCommand = "select top $maxRecordsByQuery __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > $id order by __db_mirror_id__";
+                                $sqlCommand = "select __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > $id order by __db_mirror_id__";
                                 $sourceData = $sqlServer->Query($sqlCommand, true, __max_buffer_size);
 
                                 if ($sourceData === false) {
@@ -675,18 +676,33 @@
                     // Agrega el registro a la cola de sentencias.
                     $valueList = getValidValues($tableStructure, $sourceData[$si]);
                     $sqlInsert = "('$id', '$hash', $valueList)";
-                    $sqlCommand = "insert into $tableName (__db_mirror_id__, __md5__, $fieldList) values " . $sqlInsert . ';';
                     
-                    if ($mySqlWriter->Query($sqlCommand) === false) {
-                        showMessage('Error: Realizando la insercion en tabla destino => ' . $tableName);
-                        $sqlServer->Close();
-                        $mySqlReader->Close();
-                        $mySqlReader->Close();
-                        return 1;
+                    if ($insertListCount == 0) {
+                        $insertListValues = "insert into $tableName (__db_mirror_id__, __md5__, $fieldList) values ";
+                    } else {
+                        $insertListValues .= ', ';
                     }
 
-                    $inserted++;
-                    $records++;
+                    // Acumula los valores de insercion.
+                    $insertListValues .= $sqlInsert;
+                    $insertListCount++;
+
+                    // Si llego al numero maximo de inserciones acumuladas.
+                    if ($insertListCount == __max_insert_size) {
+                        if ($mySqlWriter->Query($insertListValues) === false) {
+                            showMessage('Error: Realizando la insercion en tabla destino => ' . $tableName);
+                            $sqlServer->Close();
+                            $mySqlReader->Close();
+                            $mySqlReader->Close();
+                            return 1;
+                        }
+    
+                        $inserted += $insertListCount;
+                        $records += $insertListCount;
+                        $insertListValues = '';
+                        $insertListCount = 0;
+                    }
+
 
                     // Incrementa solamente el indice de origen.
                     $si++;
@@ -706,8 +722,7 @@
 
                         // Si no quedan registros en el buffer de la ultima consulta.
                         if ($totalSource == 0) {
-                            $maxRecordsByQuery = __max_records_by_query;
-                            $sqlCommand = "select top $maxRecordsByQuery __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > $id order by __db_mirror_id__";
+                            $sqlCommand = "select __db_mirror_id__, $fieldList from $tableName where __db_mirror_id__ > $id order by __db_mirror_id__";
                             $sourceData = $sqlServer->Query($sqlCommand, true, __max_buffer_size);
 
                             if ($sourceData === false) {
@@ -761,11 +776,6 @@
                 }
             }
 
-            $totalInserted += $inserted;
-            $totalUpdated += $updated;
-            $totalDeleted += $deleted;
-            $totalRecords += $records;
-
             // Muestra el progreso de la replicacion.
             $p = intval(($records * 100) / $n);
             showMessage("   Progreso => $records de $n registros | ($p%) | Ins: $inserted / Act: $updated / Elim: $deleted", "\r");
@@ -775,6 +785,33 @@
         if ($records == 0) {
             showMessage('   Tabla vacía...', "\r");
         }
+
+        // Si quedaron inserciones pendientes por ejecutar.
+        if ($insertListCount > 0) {
+            saveLog($insertListValues);
+            if ($mySqlWriter->Query($insertListValues) === false) {
+                showMessage('Error: Realizando la insercion en tabla destino => ' . $tableName);
+                $sqlServer->Close();
+                $mySqlReader->Close();
+                $mySqlReader->Close();
+                return 1;
+            }
+
+            $inserted += $insertListCount;
+            $records += $insertListCount;
+            $insertListValues = '';
+            $insertListCount = 0;
+
+            // Muestra el progreso de la replicacion.
+            $p = intval(($records * 100) / $n);
+            showMessage("   Progreso => $records de $n registros | ($p%) | Ins: $inserted / Act: $updated / Elim: $deleted", "\r");
+        }
+
+        // Actualiza los totales.
+        $totalInserted += $inserted;
+        $totalUpdated += $updated;
+        $totalDeleted += $deleted;
+        $totalRecords += $n;
 
         // Deja una linea de separacion.
         showMessage('');
